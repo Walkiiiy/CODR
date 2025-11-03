@@ -17,18 +17,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Fine-tuning the library models for causal language modeling (GPT, GPT-2, CTRL, ...) on a text file or a dataset.
+在文本文件或数据集上微调库中的因果语言模型（GPT、GPT-2、CTRL 等）。
 
-Here is the full list of checkpoints on the hub that can be fine-tuned by this script:
+这是 DoReMi（通过极小极大优化进行领域重加权）的主训练脚本，
+负责模型初始化、数据集加载与训练循环调度。
+
+可以使用该脚本微调的全部检查点列表：
 https://huggingface.co/models?filter=text-generation
 """
-# You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
+# 你也可以调整此脚本以适配自己的因果语言建模任务，相关提示已通过注释给出。
 
 import logging
 from pathlib import Path
 import os
 import sys
 import json
+from typing import Optional, Dict, Any
 import numpy as np
 
 import datasets
@@ -60,7 +64,7 @@ except Exception:
     pass
 
 
-# Will error if the minimal version of Transformers is not installed. Remove at your own risks.
+# 若未安装最低要求版本的 Transformers，将触发错误；自行移除此检查需自担风险。
 check_min_version("4.27.0")
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
@@ -68,20 +72,37 @@ require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/lang
 logger = logging.getLogger(__name__)
 
 
-def main():
-    # See all possible arguments in src/transformers/training_args.py
-    # or by passing the --help flag to this script.
-    # We now keep distinct sets of args, for a cleaner separation of concerns.
+def main() -> None:
+    """
+    DoReMi 的主训练函数。
+
+    该函数负责调度整个训练流程：
+    1. 解析命令行参数或 JSON 配置
+    2. 设置日志与随机种子
+    3. 加载或初始化模型与分词器
+    4. 配置领域权重与参考模型（如执行重加权）
+    5. 加载训练与评估数据集
+    6. 初始化训练器并执行训练/评估
+
+    支持的功能包括：
+    - 从零训练或基于检查点微调
+    - 使用 DoReMi 优化器进行领域重加权
+    - 从检查点恢复训练
+    - 在验证集与下游数据集上评估
+    """
+    # 所有可用参数可在 src/transformers/training_args.py 中查看
+    # 或通过向脚本传入 --help 获取。
+    # 现在我们将参数划分为不同集合，以便更清晰地分离职责。
 
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, FullTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        # If we pass only one argument to the script and it's the path to a json file,
-        # let's parse it to get our arguments.
+        # 若仅向脚本传入一个参数且它是 JSON 文件路径，
+        # 则解析该文件以获取参数。
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    # Setup logging
+    # 设置日志
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -89,7 +110,7 @@ def main():
     )
 
     if training_args.should_log:
-        # The default of training_args.log_level is passive, so we set log level at info here to have that default.
+        # training_args.log_level 默认是被动模式，这里设置为 info 以匹配默认行为。
         transformers.utils.logging.set_verbosity_info()
 
     log_level = training_args.get_process_log_level()
@@ -99,14 +120,14 @@ def main():
     transformers.utils.logging.enable_default_handler()
     transformers.utils.logging.enable_explicit_format()
 
-    # Log on each process the small summary:
+    # 在每个进程上记录概要信息：
     logger.warning(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
         + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
     logger.info(f"Training/evaluation parameters {training_args}")
 
-    # Detecting last checkpoint.
+    # 检测最近的检查点。
     last_checkpoint = None
     num_skip_examples = 0
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
@@ -126,14 +147,12 @@ def main():
             num_skip_examples = state.global_step * global_batch_size
             logger.info(f"Skipping {num_skip_examples} examples")
 
-    # Set seed before initializing model.
+    # 初始化模型前先设置随机种子。
     set_seed(training_args.seed)
 
-    # Load pretrained model and tokenizer
+    # 加载预训练模型与分词器
     #
-    # Distributed training:
-    # The .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
+    # 分布式训练：.from_pretrained 方法确保同一机器上仅有一个进程会并发下载模型与词表。
 
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -153,7 +172,7 @@ def main():
             config.pad_vocab_size_multiple = 8
             config.activation_function = 'gelu_new'
             config.n_inner = None
-            # disable absolute
+            # 关闭绝对位置编码
             config.max_position_embeddings = 0
     else:
         if model_args.model_type == 'gpt_flash':
@@ -165,10 +184,10 @@ def main():
                     use_flash_attn=True, fused_mlp=True,
                     fused_bias_fc=True, fused_dropout_add_ln=True,
                     pad_vocab_size_multiple=8)
-            # disable absolute
+            # 关闭绝对位置编码
             config.max_position_embeddings = 0
         elif model_args.model_type == 'gpt_neox_flash':
-            # convert to GPT2 config
+            # 转换为 GPT2 配置
             config = CONFIG_MAPPING['gpt_neox']()
             config = gpt_neox_config_to_gpt2_config(config)
             config.use_flash_attn = True
@@ -178,7 +197,7 @@ def main():
             config.pad_vocab_size_multiple = 8
             config.activation_function = 'gelu_new'
             config.n_inner = None
-            # disable absolute
+            # 关闭绝对位置编码
             config.max_position_embeddings = 0
         else:
             config = CONFIG_MAPPING[model_args.model_type]()
@@ -206,6 +225,7 @@ def main():
         )
     tokenizer.model_max_length = data_args.max_token_length
 
+    # 初始化模型
     if model_args.model_name_or_path:
         torch_dtype = (
             model_args.torch_dtype
@@ -238,7 +258,7 @@ def main():
 
     train_domain_weights_dict = domain_config['train_domain_weights']
     eval_domain_weights_dict = domain_config['eval_domain_weights']
-    # whenever we convert dict to array, we sort by key
+    # 将字典转换为数组时始终按键排序
     domain_list = list(sorted(train_domain_weights_dict.keys()))
 
     if training_args.reweight_domains:
@@ -277,7 +297,7 @@ def main():
         reference_model = None
 
     if training_args.do_train:
-        # data script could change tokenizer shape
+        # 数据脚本可能会改变分词器词表大小
         train_dataset = data_utils.get_preprocessed_mixed_dataset(
                 preprocessed_dir=data_args.dataset_dir,
                 domain_weights_dict=train_domain_weights_dict,
@@ -312,18 +332,18 @@ def main():
                 no_interleave=True,
                 keep_in_memory=data_args.keep_in_memory)
 
-    # turn off find unused parameters
+    # 关闭寻找未使用参数的特性
     training_args.ddp_find_unused_parameters = False
 
-    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
-    # on a small vocab and want a smaller embedding size, remove this test.
+    # 仅在必要时才调整嵌入层大小以避免索引错误。
+    # 如果你在小词表上从零训练并希望使用更小的嵌入层，可移除此检查。
     # embedding_size = model.get_input_embeddings.weight.shape[0]
     # if len(tokenizer) > embedding_size:
     #     model.resize_token_embeddings(len(tokenizer))
 
     torch.cuda.empty_cache()
 
-    # Initialize our Trainer
+    # 初始化训练器
     trainer = DoReMiTrainer(
         model=model,
         args=training_args,
@@ -333,7 +353,7 @@ def main():
         data_collator=data_utils.get_data_collator(tokenizer, do_padding=data_args.do_padding, max_length=data_args.max_token_length),
     )
 
-    # Training
+    # 训练阶段
     if training_args.do_train:
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
@@ -341,7 +361,7 @@ def main():
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        trainer.save_model()  # Saves the tokenizer too for easy upload
+        trainer.save_model()  # 同步保存分词器，便于上传
 
         metrics = train_result.metrics
 
@@ -352,12 +372,12 @@ def main():
                 metrics[f'avg_domain_weight:{domain_name}'] = model.avg_domain_weights[i].item()
                 avg_domain_weights_dict[domain_name] = model.avg_domain_weights[i].item()
 
-            # save avg domain weights to json
+            # 将平均领域权重保存为 JSON
             avg_domain_weights_file = Path(training_args.output_dir) / 'avg_domain_weights.json'
             with open(avg_domain_weights_file, 'w') as f:
                 json.dump(avg_domain_weights_dict, f, indent=2)
 
-            # also save to configs dir
+            # 同步写入 configs 目录
             config_dict = {"train_domain_weights": avg_domain_weights_dict,
                            "eval_domain_weights": avg_domain_weights_dict}
             config_dict_file = Path(__file__).parent.parent / 'configs' / f"{Path(training_args.output_dir).name}.json"
@@ -368,7 +388,7 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
-    # Evaluation
+    # 评估阶段
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
 
@@ -398,7 +418,7 @@ def main():
 
 
 def _mp_fn(index):
-    # For xla_spawn (TPUs)
+    # 供 xla_spawn（TPU）调用
     main()
 
 

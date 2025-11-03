@@ -26,16 +26,85 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+"""
+支持 Flash Attention 的 DoReMi 模型。
+
+该模块提供带有 DoReMi 扩展能力的语言模型：
+- 逐 token 损失计算以进行领域重加权
+- 引入参考模型以计算超额损失
+- 在模型输出中跟踪领域 ID
+"""
+from collections import namedtuple
+from contextlib import nullcontext
+from typing import Optional, Tuple, Union, Any, Dict
+from dataclasses import dataclass
+import torch
+from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+from einops import rearrange
+from flash_attn.models.gpt import GPTLMHeadModel as GPTLMHeadModelFlash
+from flash_attn.models.gpt import shard_state_dict_tp
+from flash_attn.utils.pretrained import state_dict_from_pretrained
+from flash_attn.models.opt import remap_state_dict_hf_opt
+from flash_attn.models.gptj import remap_state_dict_hf_gptj
+from flash_attn.models.gpt_neox import remap_state_dict_hf_gpt_neox
+from flash_attn.models.gpt import remap_state_dict_hf_gpt2
+from flash_attn.utils.distributed import all_gather_raw
+try:
+    from flash_attn.losses.cross_entropy import CrossEntropyLoss
+    from flash_attn.ops.fused_dense import ColumnParallelLinear
+except Exception:
+    from torch.nn import CrossEntropyLoss
+    ColumnParallelLinear = None
+
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 @dataclass
 class CausalLMOutputWithDomainIDs(CausalLMOutputWithCrossAttentions):
+    """
+    包含 DoReMi 特定字段的扩展模型输出。
+
+    该输出类在 CausalLMOutputWithCrossAttentions 基础上新增领域 ID 与逐 token 损失，
+    用于 DoReMi 的领域重加权。
+
+    属性：
+        domain_ids: 批次中每个样本的领域 ID（可选）。
+        reference_pertoken_loss: 参考模型的逐 token 损失（用于计算超额损失）。
+        pertoken_loss: 当前模型的逐 token 损失。
+        token_mask: 标记哪些 token 不是填充（有效 token 为 1.0）。
+        hidden_states: 送入最终线性层与 softmax 前的隐藏状态（嵌入）。
+    """
     domain_ids: Optional[torch.LongTensor] = None
-    reference_pertoken_loss: Optional[torch.FloatTensor] = None  # corresponds to uniq_domain_ids
-    pertoken_loss: Optional[torch.FloatTensor] = None  # corresponds to uniq_domain_ids
-    token_mask: Optional[torch.FloatTensor] = None  # 1.0 for tokens that are not padding
-    hidden_states: Optional[torch.FloatTensor] = None  # embeddings before linear + softmax
+    """每个批次样本的领域 ID 张量。"""
+    reference_pertoken_loss: Optional[torch.FloatTensor] = None
+    """参考模型的逐 token 损失（用于超额损失计算）。"""
+    pertoken_loss: Optional[torch.FloatTensor] = None
+    """当前模型的逐 token 损失。"""
+    token_mask: Optional[torch.FloatTensor] = None
+    """标记有效（非填充）token 的掩码（有效为 1.0，填充为 0.0）。"""
+    hidden_states: Optional[torch.FloatTensor] = None
+    """进入最终线性层与 softmax 前的隐藏状态（嵌入）。"""
 
 
 class GPTFlashAttnLMHeadModel(GPTLMHeadModelFlash):
+    """
+    结合 Flash Attention 的 GPT 模型，具备 DoReMi 能力。
+
+    此模型在 GPTLMHeadModelFlash 基础上扩展：
+    - 逐 token 损失计算
+    - 引入参考模型以计算超额损失
+    - 在输出中保留领域 ID
+    - 支持动态更新领域权重
+
+    属性：
+        ignore_index: 损失计算时忽略的标签值（-100）。
+        loss_fct: 标准训练使用的损失函数（取平均）。
+        pertoken_loss_fct: 逐 token 损失函数（不做约简）。
+        reference_model: 用于超额损失计算的参考模型（可选）。
+    """
 
     def __init__(self, config, process_group=None, device=None, dtype=None):
         super().__init__(config, process_group=process_group, device=device, dtype=dtype)
@@ -51,10 +120,10 @@ class GPTFlashAttnLMHeadModel(GPTLMHeadModelFlash):
 
     def _forward(self, input_ids, position_ids=None, inference_params=None, last_token_only=False, output_hidden_states=False):
         """
-            inference_params: for generation. Adapted from Megatron-LM (and Apex)
+            inference_params: 用于生成，来自 Megatron-LM（及 Apex）的改写
             https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
-            last_token_only: whether to return the logit for the last token only,
-                of shape (batch_size, vocab_size)
+            last_token_only: 是否仅返回最后一个 token 的 logits，
+                形状为 (batch_size, vocab_size)
         """
         hidden_states = self.transformer(input_ids, position_ids=position_ids,
                                          inference_params=inference_params)
@@ -63,7 +132,7 @@ class GPTFlashAttnLMHeadModel(GPTLMHeadModelFlash):
         if self.project_out is not None:
             hidden_states = self.project_out(hidden_states)
         lm_logits = self.lm_head(hidden_states)
-        # During inference, we want the full logit for sampling
+        # 推理阶段需要完整的 logits 以供采样
         if isinstance(self.lm_head, ColumnParallelLinear) and inference_params is not None:
             lm_logits, _ = all_gather_raw(lm_logits, self.lm_head.process_group)
             lm_logits = rearrange(lm_logits, '(n b) ... d -> b ... (n d)', b=hidden_states.shape[0])
@@ -105,14 +174,14 @@ class GPTFlashAttnLMHeadModel(GPTLMHeadModelFlash):
             lm_logits = fwd_output.logits
 
             if labels is not None:
-                # move labels to correct device to enable model parallelism
+                # 将标签移动到与 logits 相同的设备以支持模型并行
                 labels = labels.to(lm_logits.device)
-                # Shift so that tokens < n predict n
+                # 向左平移，使位置 n 的 token 由位置 n-1 进行预测
                 with torch.autocast('cuda', enabled=False):
-                    # upcast logits to float32, especially for larger vocabs (120k+)
+                    # 将 logits 升级为 float32，尤其适用于大词表（12 万以上）
                     shift_logits = lm_logits[:, :-1, :].contiguous().float()
                     shift_labels = labels[:, 1:].contiguous()
-                    # Flatten the tokens
+                    # 将 token 展平成一维
                     loss = self.loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             else:
                 loss = None
@@ -142,14 +211,14 @@ class GPTFlashAttnLMHeadModel(GPTLMHeadModelFlash):
             pertoken_loss = None
             reference_pertoken_loss = None
             if labels is not None:
-                # move labels to correct device to enable model parallelism
+                # 将标签移动到与 logits 相同的设备以支持模型并行
                 labels = labels.to(lm_logits.device)
                 ignore_index = -100
                 with torch.autocast('cuda', enabled=False):
-                    # upcast logits to float32
+                    # 将 logits 升级为 float32
                     shift_logits = lm_logits[:, :-1, :].contiguous().float()
                     shift_labels = labels[:, 1:].contiguous()
-                    # Flatten the tokens
+                    # 将 token 展平成一维
                     pertoken_loss = self.pertoken_loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
                 pertoken_loss = pertoken_loss.view(shift_labels.size(0), shift_labels.size(1))
@@ -157,7 +226,7 @@ class GPTFlashAttnLMHeadModel(GPTLMHeadModelFlash):
 
                 loss = pertoken_loss.sum() / token_mask.sum()
 
-                # run reference model forward to get pertoken_loss
+                # 若存在参考模型，则前向计算以获得逐 token 损失
                 if self.reference_model is not None:
                     self.reference_model.train()
                     with nullcontext() if reference_gradients else torch.no_grad():
@@ -207,13 +276,12 @@ class GPTFlashAttnLMHeadModel(GPTLMHeadModelFlash):
     def from_pretrained(cls, model_name, config, *args, strict=True, device=None, dtype=None,
                         world_size=1, rank=0, **kwargs):
         """
-        Instantiate a GPTPreTrainedModel from a pre-trained model file or a pytorch state dict.
-        Download and cache the pre-trained model file if needed.
+        从预训练模型文件或 PyTorch state_dict 实例化 GPTPreTrainedModel。
+        如有需要，将预训练模型文件下载并缓存。
         """
-        # Instantiate model.
+        # 实例化模型
         model = cls(config, *args, device=device, dtype=dtype, **kwargs)
-        # Load state_dict in cpu because we already initialized the model in GPU, and we don't
-        # want extra stuff taking up more GPU memory
+        # 在 CPU 中加载 state_dict，避免在已初始化 GPU 模型时额外占用显存
         state_dict = state_dict_from_pretrained(model_name, device='cpu', dtype=dtype)
         if model_name.startswith('gpt2'):
             state_dict = remap_state_dict_hf_gpt2(state_dict, config)
@@ -221,7 +289,7 @@ class GPTFlashAttnLMHeadModel(GPTLMHeadModelFlash):
             state_dict = remap_state_dict_hf_opt(state_dict, config)
         elif model_name.startswith('EleutherAI/gpt-j-'):
             state_dict = remap_state_dict_hf_gptj(state_dict, config)
-            strict = False  # We have rotary_emb.inf_freq buffers not in the GPT-J checkpoint
+            strict = False  # GPT-J 检查点中缺少 rotary_emb.inf_freq 缓冲区
         elif model_name.startswith('EleutherAI/gpt-neox-') or model_name.startswith('EleutherAI/pythia-'):
             state_dict = remap_state_dict_hf_gpt_neox(state_dict, config)
         else:

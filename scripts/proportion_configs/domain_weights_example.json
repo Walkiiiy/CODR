@@ -1,0 +1,10 @@
+{
+  "train_domain_weights": {
+    "domain_a": 0.6,
+    "domain_b": 0.4
+  },
+  "eval_domain_weights": {
+    "domain_a": 0.5,
+    "domain_b": 0.5
+  }
+}

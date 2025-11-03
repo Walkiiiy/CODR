@@ -2,8 +2,17 @@
 # coding=utf-8
 
 """
-Modern training script for DoReMi fine-tuning.
-Optimized for small-scale training on 2x24GB GPUs with modern transformers.
+DoReMi 微调的现代化训练脚本。
+
+该脚本提供经过现代化改造的 DoReMi 训练接口，
+针对 2×24GB GPU 的小规模训练进行了优化，并使用标准 Transformers 的优化特性，
+无需依赖 flash-attention 编译。
+
+主要特性：
+- 简化的模型加载与初始化流程
+- 现代 Transformers 优化（梯度检查点、高效注意力等）
+- 支持带有 DoReMi 扩展的标准 GPT2 模型
+- 兼容全部 DoReMi 训练功能（领域重加权、评估等）
 """
 
 import logging
@@ -41,20 +50,33 @@ from doremi.models_modern import (
     DoReMiGPT2LMHeadModel
 )
 
-# Modern transformers version check
+# 检查所需的 Transformers 现代版本
 check_min_version("4.40.0")
 
 logger = logging.getLogger(__name__)
 
 
-def main():
+def main() -> None:
+    """
+    现代版 DoReMi 训练的主函数。
+
+    该函数在现代 Transformers 框架下调度完整训练流程：
+    1. 解析命令行参数或 JSON 配置
+    2. 设置日志与随机种子
+    3. 加载或初始化模型与分词器（使用现代模型类）
+    4. 配置领域权重与参考模型（如需重加权）
+    5. 加载训练与评估数据集
+    6. 初始化训练器并执行训练/评估
+
+    功能与 train.py 相同，但使用 models_modern 保持兼容性。
+    """
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, FullTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    # Setup logging
+    # 设置日志
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -77,7 +99,7 @@ def main():
     )
     logger.info(f"Training/evaluation parameters {training_args}")
 
-    # Checkpoint detection
+    # 检测检查点
     last_checkpoint = None
     num_skip_examples = 0
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
@@ -98,7 +120,7 @@ def main():
 
     set_seed(training_args.seed)
 
-    # Load config
+    # 加载配置
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
@@ -110,7 +132,7 @@ def main():
     elif model_args.model_name_or_path:
         config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
     else:
-        # Create from scratch with modern defaults
+        # 使用现代默认值从零创建配置
         config = create_modern_config(model_args.model_type, model_args.config_overrides)
         logger.warning("Creating new config from scratch.")
         
@@ -119,7 +141,7 @@ def main():
             config.update_from_string(model_args.config_overrides)
             logger.info(f"New config: {config}")
 
-    # Load tokenizer
+    # 加载分词器
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
         "use_fast": model_args.use_fast_tokenizer,
@@ -136,12 +158,12 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
         )
     
-    # Set max length
+    # 设置最大长度
     tokenizer.model_max_length = data_args.max_token_length
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load or create model
+    # 加载或创建模型
     model_class = get_model_class(model_args.model_type)
     
     if model_args.model_name_or_path:
@@ -151,7 +173,7 @@ def main():
             else getattr(torch, model_args.torch_dtype)
         )
         
-        # Simplified: just load the model directly
+        # 简化流程：直接加载模型
         try:
             model = model_class.from_pretrained(
                 model_args.model_name_or_path,
@@ -173,17 +195,17 @@ def main():
                 torch_dtype=torch_dtype,
             )
     else:
-        # Create from scratch
+        # 从零构建模型
         model = model_class(config)
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
         logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
 
-    # Enable gradient checkpointing for memory efficiency
+    # 启用梯度检查点以节省显存
     if hasattr(model, 'gradient_checkpointing_enable'):
         model.gradient_checkpointing_enable()
         logger.info("Enabled gradient checkpointing")
 
-    # Load domain config
+    # 加载领域配置
     with open(training_args.domain_config_path, 'r') as f:
         domain_config = json.load(f)
 
@@ -191,7 +213,7 @@ def main():
     eval_domain_weights_dict = domain_config['eval_domain_weights']
     domain_list = list(sorted(train_domain_weights_dict.keys()))
 
-    # Setup reference model if doing reweighting
+    # 若进行重加权则准备参考模型
     if training_args.reweight_domains:
         torch_dtype = (
             model_args.torch_dtype
@@ -225,7 +247,7 @@ def main():
     else:
         reference_model = None
 
-    # Prepare datasets
+    # 准备数据集
     if training_args.do_train:
         train_dataset = data_utils.get_preprocessed_mixed_dataset(
                 preprocessed_dir=data_args.dataset_dir,
@@ -265,7 +287,7 @@ def main():
 
     torch.cuda.empty_cache()
 
-    # Initialize trainer
+    # 初始化训练器
     trainer = DoReMiTrainer(
         model=model,
         args=training_args,
@@ -275,7 +297,7 @@ def main():
         data_collator=data_utils.get_data_collator(tokenizer, do_padding=data_args.do_padding, max_length=data_args.max_token_length),
     )
 
-    # Training
+    # 训练阶段
     if training_args.do_train:
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
@@ -294,12 +316,12 @@ def main():
                 metrics[f'avg_domain_weight:{domain_name}'] = model.avg_domain_weights[i].item()
                 avg_domain_weights_dict[domain_name] = model.avg_domain_weights[i].item()
 
-            # Save avg domain weights to json
+            # 将平均领域权重保存为 JSON
             avg_domain_weights_file = Path(training_args.output_dir) / 'avg_domain_weights.json'
             with open(avg_domain_weights_file, 'w') as f:
                 json.dump(avg_domain_weights_dict, f, indent=2)
 
-            # Also save to configs dir
+            # 同步写入 configs 目录
             config_dict = {"train_domain_weights": avg_domain_weights_dict,
                            "eval_domain_weights": avg_domain_weights_dict}
             config_dict_file = Path(__file__).parent.parent / 'configs' / f"{Path(training_args.output_dir).name}.json"
@@ -310,7 +332,7 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
-    # Evaluation
+    # 评估阶段
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
 
@@ -342,7 +364,7 @@ def main():
 
 
 def _mp_fn(index):
-    # For xla_spawn (TPUs)
+    # 供 xla_spawn（TPU）调用
     main()
 
 

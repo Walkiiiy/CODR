@@ -1,14 +1,26 @@
+"""
+DoReMi 训练脚本使用的训练参数。
+
+该模块定义了模型、数据与训练配置所需的数据类。
+所有参数均兼容 HuggingFace Transformers 的训练参数。
+"""
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple, List, Any
 from transformers import TrainingArguments, MODEL_FOR_CAUSAL_LM_MAPPING
 
-MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
-MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+MODEL_CONFIG_CLASSES: List[Any] = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
+"""Transformers 支持的模型配置类列表。"""
+MODEL_TYPES: Tuple[str, ...] = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+"""支持的模型类型元组。"""
+
 
 @dataclass
 class ModelArguments:
     """
-    Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
+    与将要微调或从零训练的模型/配置/分词器相关的参数。
+
+    此数据类定义了 DoReMi 训练中加载或初始化语言模型所需的全部参数，
+    同时支持使用预训练模型或从头训练。
     """
 
     model_name_or_path: Optional[str] = field(
@@ -70,7 +82,13 @@ class ModelArguments:
         },
     )
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """
+        初始化后校验参数组合是否有效。
+
+        异常：
+            ValueError: 当 config_overrides 与 config_name 或 model_name_or_path 同时使用时抛出。
+        """
         if self.config_overrides is not None and (self.config_name is not None or self.model_name_or_path is not None):
             raise ValueError(
                 "--config_overrides can't be used in combination with --config_name or --model_name_or_path"
@@ -80,7 +98,9 @@ class ModelArguments:
 @dataclass
 class DataTrainingArguments:
     """
-    Arguments pertaining to what data we are going to input our model for training and eval.
+    与用于训练和评估的数据相关的参数。
+
+    此数据类涵盖 DoReMi 训练中涉及的数据集加载、预处理与数据增强的全部参数。
     """
 
     dataset_dir: str = field(
@@ -162,6 +182,17 @@ class DataTrainingArguments:
 
 @dataclass
 class FullTrainingArguments(TrainingArguments):
+    """
+    DoReMi 训练用的扩展训练参数。
+
+    该类在 HuggingFace TrainingArguments 基础上新增 DoReMi 特有参数：
+    - 领域重加权配置
+    - 参考模型路径
+    - 自定义学习率调度器
+    - 下游评估设置
+
+    同时继承 Transformers 的全部标准训练参数。
+    """
     domain_config_path: str = field(
         default='.', metadata={"help": "Path to the domain config file."}
             )

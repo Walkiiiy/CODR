@@ -42,11 +42,96 @@ if is_torch_tpu_available(check_device=False):
     import torch_xla.distributed.parallel_loader as pl
 
 
+"""
+DoReMi 训练器与学习率调度器。
+
+该模块在 HuggingFace Trainer 基础上扩展了 DoReMi 特定功能：
+- 训练期间动态更新领域权重
+- 带热身阶段的自定义学习率调度器
+- 逐 token 损失的领域重加权计算
+- 按领域统计指标的评估流程
+"""
+import math
+import warnings
+import json
+import re
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple, Union, Callable
+import wandb
+import numpy as np
+from collections import defaultdict
+from tqdm import tqdm
+import torch
+import torch.distributed as dist
+from torch import nn
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
+from torch.utils.data import DataLoader
+from datasets import IterableDataset
+from transformers import Trainer
+from transformers.utils import ExplicitEnum, is_torch_tpu_available
+from transformers.optimization import get_scheduler
+from transformers.utils import logging
+from transformers.trainer import is_sagemaker_mp_enabled
+from transformers.modeling_utils import unwrap_model
+from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+from transformers.trainer_utils import (
+        has_length,
+        denumpify_detensorize,
+        EvalLoopOutput,
+        enable_full_determinism,
+        set_seed,
+        get_last_checkpoint,
+        PREFIX_CHECKPOINT_DIR
+)
+from transformers.trainer_pt_utils import find_batch_size
+
+from doremi.eval_datasets import get_eval_dataset
+
+
+logger = logging.get_logger(__name__)
+
+if is_torch_tpu_available(check_device=False):
+    import torch_xla.core.xla_model as xm
+    import torch_xla.debug.metrics as met
+    import torch_xla.distributed.parallel_loader as pl
+
+
 class LinearWarmupExponentialLR(LRScheduler):
     """
-    Exponential LR with linear warmup and decay to some end LR.
+    带线性热身的指数学习率调度器。
+
+    该调度器会在 num_warmup_steps 步内从 lr_start 线性升至基础学习率，
+    随后在剩余训练步中以指数方式衰减至 lr_end。
+
+    属性：
+        num_warmup_steps: 线性热身步骤数。
+        num_training_steps: 总训练步数。
+        lr_start: 热身阶段的起始学习率。
+        lr_end: 衰减结束时的学习率。
     """
-    def __init__(self, optimizer, num_warmup_steps, num_training_steps, lr_start=1e-7, lr_end=0, last_epoch=-1, verbose=False):
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        num_warmup_steps: int,
+        num_training_steps: int,
+        lr_start: float = 1e-7,
+        lr_end: float = 0,
+        last_epoch: int = -1,
+        verbose: bool = False
+    ) -> None:
+        """
+        初始化带线性热身的指数学习率调度器。
+
+        参数：
+            optimizer: 需要调度学习率的优化器。
+            num_warmup_steps: 热身步骤数。
+            num_training_steps: 总训练步数。
+            lr_start: 热身初始学习率。
+            lr_end: 衰减末尾的目标学习率。
+            last_epoch: 上一次的 epoch 索引（用于恢复）。
+            verbose: 若为 True，则打印学习率更新。
+        """
         self.num_warmup_steps = num_warmup_steps
         self.num_training_steps = num_training_steps
         self.lr_start = lr_start
@@ -66,7 +151,7 @@ class LinearWarmupExponentialLR(LRScheduler):
         if self.last_epoch < self.num_warmup_steps:
             return [self.lr_start + (base_lr - self.lr_start) * self.last_epoch / self.num_warmup_steps for base_lr in self.base_lrs]
         else:
-            # figure out decay rate to use to get within 1e-10 of lr_end at end of training
+            # 计算衰减率，使训练末尾的学习率接近 lr_end（误差在 1e-10 内）
             gammas = [np.exp(np.log(1e-10 / (base_lr - self.lr_end)) / (self.num_training_steps - self.num_warmup_steps))
                       for base_lr in self.base_lrs]
             return [self.lr_end + (base_lr - self.lr_end) * gamma ** (self.last_epoch - self.num_warmup_steps) for base_lr, gamma in zip(self.base_lrs, gammas)]
@@ -74,9 +159,39 @@ class LinearWarmupExponentialLR(LRScheduler):
 
 class LinearWarmupCosineLR(LRScheduler):
     """
-    Cosine LR with linear warmup and decay to some end LR.
+    带线性热身的余弦学习率调度器。
+
+    该调度器会在 num_warmup_steps 步内从 lr_start 线性升到基础学习率，
+    之后在剩余训练步中按余弦曲线从基础学习率衰减至 lr_end。
+
+    属性：
+        num_warmup_steps: 线性热身步骤数。
+        num_training_steps: 总训练步数。
+        lr_start: 热身阶段的起始学习率。
+        lr_end: 衰减结束时的学习率。
     """
-    def __init__(self, optimizer, num_warmup_steps, num_training_steps, lr_start=1e-7, lr_end=0, last_epoch=-1, verbose=False):
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        num_warmup_steps: int,
+        num_training_steps: int,
+        lr_start: float = 1e-7,
+        lr_end: float = 0,
+        last_epoch: int = -1,
+        verbose: bool = False
+    ) -> None:
+        """
+        初始化带线性热身的余弦学习率调度器。
+
+        参数：
+            optimizer: 需要调度学习率的优化器。
+            num_warmup_steps: 热身步骤数。
+            num_training_steps: 总训练步数。
+            lr_start: 热身初始学习率。
+            lr_end: 衰减末尾的目标学习率。
+            last_epoch: 上一次的 epoch 索引（用于恢复）。
+            verbose: 若为 True，则打印学习率更新。
+        """
         self.num_warmup_steps = num_warmup_steps
         self.num_training_steps = num_training_steps
         self.lr_start = lr_start
@@ -100,24 +215,48 @@ class LinearWarmupCosineLR(LRScheduler):
 
 
 class ExtendedSchedulerType(ExplicitEnum):
+    """DoReMi 训练中扩展的学习率调度器类型。"""
     LINEAR_WARMUP_EXPONENTIAL = "linear_warmup_exponential"
+    """线性热身 + 指数衰减调度器。"""
     LINEAR_WARMUP_COSINE = "linear_warmup_cosine"
+    """线性热身 + 余弦衰减调度器。"""
 
 
-# extend scheduler function mapping
-TYPE_TO_EXTENDED_SCHEDULER_FUNCTION = {
+# 扩展调度器类型到实现的映射
+TYPE_TO_EXTENDED_SCHEDULER_FUNCTION: Dict[ExtendedSchedulerType, type] = {
         ExtendedSchedulerType.LINEAR_WARMUP_EXPONENTIAL: LinearWarmupExponentialLR,
         ExtendedSchedulerType.LINEAR_WARMUP_COSINE: LinearWarmupCosineLR
 }
+"""从调度器类型枚举到调度器类的映射。"""
 
 
 def get_scheduler_extended(
-    name,
-    optimizer,
-    num_warmup_steps=0,
-    num_training_steps=0,
-    lr_end=1e-4,
-):
+    name: Union[str, ExtendedSchedulerType],
+    optimizer: Optimizer,
+    num_warmup_steps: int = 0,
+    num_training_steps: int = 0,
+    lr_end: float = 1e-4,
+) -> LRScheduler:
+    """
+    获取扩展的学习率调度器（支持 DoReMi 自定义调度器）。
+
+    该函数基于 HuggingFace 的 get_scheduler 扩展，支持
+    LinearWarmupExponentialLR 与 LinearWarmupCosineLR 等 DoReMi 调度器；
+    对其他名称则回退到标准 Transformers 调度器。
+
+    参数：
+        name: 调度器名称或 ExtendedSchedulerType 枚举值。
+        optimizer: 需要调度学习率的优化器。
+        num_warmup_steps: 热身步骤数。
+        num_training_steps: 总训练步数。
+        lr_end: 扩展调度器使用的目标末尾学习率。
+
+    返回：
+        LRScheduler: 配置好的学习率调度器。
+
+    异常：
+        ValueError: 当扩展调度器需要 num_training_steps 却未提供时抛出。
+    """
 
     try:
         name = ExtendedSchedulerType(name)
@@ -125,7 +264,7 @@ def get_scheduler_extended(
     except ValueError:
         return get_scheduler(name, optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
 
-    # All other schedulers require `num_training_steps`
+    # 其他所有调度器都需要提供 `num_training_steps`
     if num_training_steps is None:
         raise ValueError(f"{name} requires `num_training_steps`, please provide that argument.")
 
@@ -133,36 +272,82 @@ def get_scheduler_extended(
 
 
 class DoReMiTrainer(Trainer):
+    """
+    在 HuggingFace Trainer 基础上扩展领域重加权的 DoReMi 训练器。
 
-    def __init__(self, *args, **kwargs):
+    该训练器实现 DoReMi 算法，训练过程中自适应更新领域权重，
+    计算逐 token 损失，并据此调整训练样本的权重。
+
+    属性：
+        domain_config: JSON 加载的领域配置字典。
+        train_domain_weights_dict: 训练领域名称到权重的映射。
+        eval_domain_weights_dict: 评估领域名称到权重的映射。
+        domain_list: 排序后的训练领域名称列表。
+        eval_domain_list: 排序后的评估领域名称列表。
+        sampling_weights: 每个领域的采样权重张量。
+        pertoken_scores: 累积的逐 token 超额损失列表。
+        token_masks: 累积的 token 掩码列表（处理填充）。
+        domain_ids: 累积的领域 ID 列表。
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """
+        初始化 DoReMi 训练器。
+
+        加载领域配置并初始化领域权重追踪，
+        同时创建缓冲区以在训练期间累积逐 token 得分。
+        """
         super().__init__(*args, **kwargs)
 
         with open(self.args.domain_config_path, 'r') as f:
-            self.domain_config = json.load(f)
+            self.domain_config: Dict[str, Any] = json.load(f)
 
-        self.train_domain_weights_dict = self.domain_config['train_domain_weights']
-        self.eval_domain_weights_dict = self.domain_config['eval_domain_weights']
+        self.train_domain_weights_dict: Dict[str, float] = self.domain_config['train_domain_weights']
+        self.eval_domain_weights_dict: Dict[str, float] = self.domain_config['eval_domain_weights']
 
-        self.eval_domain_list = list(sorted(self.eval_domain_weights_dict.keys()))
-        self.domain_list = list(sorted(self.train_domain_weights_dict.keys()))
-        self.sampling_weights = torch.tensor([self.train_domain_weights_dict[domain] for domain in self.domain_list])
+        self.eval_domain_list: List[str] = list(sorted(self.eval_domain_weights_dict.keys()))
+        self.domain_list: List[str] = list(sorted(self.train_domain_weights_dict.keys()))
+        self.sampling_weights: torch.Tensor = torch.tensor(
+            [self.train_domain_weights_dict[domain] for domain in self.domain_list]
+        )
 
-        self.pertoken_scores = []
-        self.token_masks = []
-        self.domain_ids = []
+        self.pertoken_scores: List[torch.Tensor] = []
+        self.token_masks: List[torch.Tensor] = []
+        self.domain_ids: List[torch.Tensor] = []
 
-        # we will take care of skipping in dataloader
+        # 数据加载器会处理样本跳过逻辑
         self.args.ignore_data_skip = True
 
-    def write_weights(self, weights):
+    def write_weights(self, weights: torch.Tensor) -> None:
+        """
+        更新模型缓冲区中的领域权重。
+
+        参数：
+            weights: 新的领域权重张量（写入前会归一化）。
+        """
         self.model.update_counter += 1
         self.model.train_domain_weights[:] = weights.float()
-        self.model.avg_domain_weights[:] = (self.model.avg_domain_weights * (self.model.update_counter - 1) + weights) / self.model.update_counter
+        self.model.avg_domain_weights[:] = (
+            (self.model.avg_domain_weights * (self.model.update_counter - 1) + weights)
+            / self.model.update_counter
+        )
 
-    def read_weights(self):
+    def read_weights(self) -> torch.Tensor:
+        """
+        读取模型缓冲区中的当前领域权重。
+
+        返回：
+            torch.Tensor: 当前训练领域权重的副本。
+        """
         return self.model.train_domain_weights.clone()
 
-    def set_attributes(self, **kwargs):
+    def set_attributes(self, **kwargs: Any) -> None:
+        """
+        在训练器实例上设置任意属性。
+
+        参数：
+            **kwargs: 需要设置的属性名与属性值。
+        """
         for k, v in kwargs.items():
             setattr(self, k, v)
 
@@ -178,11 +363,11 @@ class DoReMiTrainer(Trainer):
 
     def create_scheduler(self, num_training_steps, optimizer=None):
         """
-        Setup the scheduler. The optimizer of the trainer must have been set up either before this method is called or
-        passed as an argument.
+        配置学习率调度器。调用此前需已设置训练器的优化器，
+        或通过参数显式传入。
 
-        Args:
-            num_training_steps (int): The number of training steps to do.
+        参数：
+            num_training_steps (int): 计划执行的训练步数。
         """
         if self.lr_scheduler is None:
             if self.args.lr_scheduler_name is not None:
@@ -200,9 +385,9 @@ class DoReMiTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, return_pertoken_losses=False):
         """
-        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+        说明训练器如何计算损失。默认情况下，所有模型都会在输出的首个元素返回损失值。
 
-        Subclass and override for custom behavior.
+        子类可重写以实现自定义行为。
         """
         if self.label_smoother is not None and "labels" in inputs:
             labels = inputs.pop("labels")
@@ -212,8 +397,8 @@ class DoReMiTrainer(Trainer):
         inputs['return_pertoken_losses'] = return_pertoken_losses
 
         outputs = model(**inputs)
-        # Save past state if it exists
-        # TODO: this needs to be fixed and made cleaner later.
+        # 如存在 past 状态则保存
+        # TODO：后续需整理为更优雅的实现
         if self.args.past_index >= 0:
             self._past = outputs[self.args.past_index]
 
@@ -228,7 +413,7 @@ class DoReMiTrainer(Trainer):
                     "The model did not return a loss from the inputs, only the following keys: "
                     f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
                 )
-            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            # 这里不直接使用 .loss，因为模型可能返回元组而非 ModelOutput
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
         if return_outputs:
@@ -273,9 +458,9 @@ class DoReMiTrainer(Trainer):
         """
         Perform a training step on a batch of inputs.
 
-        Subclass and override to inject custom behavior.
+        子类可重写 to inject custom behavior.
 
-        Args:
+        参数：
             model (`nn.Module`):
                 The model to train.
             inputs (`Dict[str, Union[torch.Tensor, Any]]`):
@@ -284,7 +469,7 @@ class DoReMiTrainer(Trainer):
                 The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
                 argument `labels`. Check your model's documentation for all accepted arguments.
 
-        Return:
+        返回：
             `torch.Tensor`: The tensor with training loss on this batch.
         """
         model.train()
@@ -330,7 +515,7 @@ class DoReMiTrainer(Trainer):
                     token_masks = torch.cat(self.token_masks, dim=0).bool()
                     domain_ids = torch.cat(self.domain_ids, dim=0)
 
-                    # update domain weights
+                    # 更新领域权重
                     self.update_domain_weights(pertoken_scores, token_masks, domain_ids)
 
                     self.pertoken_scores = []
@@ -342,21 +527,21 @@ class DoReMiTrainer(Trainer):
                 dist.gather(inputs['domain_ids'], dst=0)
 
             if self.args.doremi_optimizer == 'doremiv1':
-                # compute the rescaled loss, divide by domain weights
+                # 计算重缩放后的损失，并根据领域权重做归一
                 train_domain_weights = self.read_weights().to(pertoken_loss.device).float()
 
-                # if doing non-uniform sampling, normalize by inverse sampling weight
+                # 若进行非均匀采样，则按采样权重的倒数归一化
                 train_domain_weights = train_domain_weights / self.sampling_weights.to(train_domain_weights.device)
                 train_domain_weights = train_domain_weights / train_domain_weights.sum()
                 curr_domain_weights = train_domain_weights[inputs['domain_ids']].unsqueeze(-1).expand_as(pertoken_loss).detach()
 
                 curr_domain_weights = curr_domain_weights * token_mask
 
-                # renormalize
+                # 重新归一化
                 normalizer = curr_domain_weights.detach().sum()
-                # gather normalizer across GPUs
+                # 在多 GPU 间汇总归一化因子
                 dist.all_reduce(normalizer, op=torch.distributed.ReduceOp.SUM)
-                # scale by world size because DDP averages gradients
+                # 由于 DDP 会平均梯度，需要按 world size 缩放
                 normalizer = torch.clip(normalizer, min=1e-10) / self.args.world_size
 
                 token_mask = token_mask.detach().type(pertoken_loss.dtype)
@@ -368,10 +553,10 @@ class DoReMiTrainer(Trainer):
                 loss = self.compute_loss(model, inputs)
 
         if self.args.n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+            loss = loss.mean()  # 对多 GPU 训练取均值
 
         if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
-            # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
+            # deepspeed 会在其 backward 中处理梯度累积步的缩放
             loss = loss / self.args.gradient_accumulation_steps
 
         if self.do_grad_scaling:
@@ -380,7 +565,7 @@ class DoReMiTrainer(Trainer):
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
         elif self.deepspeed:
-            # loss gets scaled under gradient_accumulation_steps in deepspeed
+            # 在 deepspeed 中损失会自动按梯度累积步缩放
             loss = self.deepspeed.backward(loss)
         else:
             loss.backward()
@@ -388,17 +573,17 @@ class DoReMiTrainer(Trainer):
         return loss.detach()
 
     def load_checkpoint(self, resume_from_checkpoint=None):
-        # Model re-init
+        # 模型重新初始化
         model_reloaded = False
         if self.model_init is not None:
-            # Seed must be set before instantiating the model when using model_init.
+            # 使用 model_init 时需先设定随机种子再实例化模型。
             enable_full_determinism(self.args.seed) if self.args.full_determinism else set_seed(self.args.seed)
             self.model = self.call_model_init(None)
             model_reloaded = True
-            # Reinitializes optimizer and scheduler
+            # 重新初始化优化器与调度器
             self.optimizer, self.lr_scheduler = None, None
 
-        # Load potential model checkpoint
+        # 加载可能存在的模型检查点
         if resume_from_checkpoint is None:
             resume_from_checkpoint = get_last_checkpoint(self.args.output_dir)
 
@@ -408,7 +593,7 @@ class DoReMiTrainer(Trainer):
         if resume_from_checkpoint is not None and not is_sagemaker_mp_enabled() and self.args.deepspeed is None:
             self._load_from_checkpoint(resume_from_checkpoint)
 
-        # If model was re-initialized, put it on the right device and update self.model_wrapped
+        # 若模型被重新初始化，则放置到目标设备并更新 self.model_wrapped
         if model_reloaded:
             if self.place_model_on_device:
                 self._move_model_to_device(self.model, self.args.device)
@@ -442,13 +627,12 @@ class DoReMiTrainer(Trainer):
         args = self.args
 
         if prediction_loss_only:
-            # hack - don't do prediction loss only
+            # 临时处理：避免仅计算预测损失
             prediction_loss_only = None
 
-        # if eval is called w/o train init deepspeed here
+        # 若在未初始化训练状态下执行评估，则在此初始化 deepspeed
         if args.deepspeed and not self.deepspeed:
-            # XXX: eval doesn't have `resume_from_checkpoint` arg but we should be able to do eval
-            # from the checkpoint eventually
+            # XXX：评估当前没有 `resume_from_checkpoint` 参数，未来应支持从检查点评估
             deepspeed_engine, _, _ = deepspeed_init(
                 self, num_training_steps=0, resume_from_checkpoint=None, inference=True
             )
@@ -458,8 +642,7 @@ class DoReMiTrainer(Trainer):
 
         model = self._wrap_model(self.model, training=False, dataloader=dataloader)
 
-        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
-        # while ``train`` is running, cast it to the right dtype first and then put on device
+        # 若希望在非训练态下以 full fp16 或 bf16 执行评估/预测，先转换为目标精度再放置到设备上
         if not self.is_in_train:
             if args.fp16_full_eval:
                 model = model.to(dtype=torch.float16, device=args.device)
@@ -491,17 +674,17 @@ class DoReMiTrainer(Trainer):
         tokencounts = torch.zeros(len(self.eval_domain_list)).cuda()
         examplecounts = torch.zeros(len(self.eval_domain_list)).cuda()
         observed_num_examples = 0
-        # Main evaluation loop
+        # 主评估循环
         for step, inputs in tqdm(enumerate(dataloader)):
-            # Update the observed num examples
+            # 更新已观察的样本数量
             observed_batch_size = find_batch_size(inputs)
             if observed_batch_size is not None:
                 observed_num_examples += observed_batch_size
-                # For batch samplers, batch_size is not known by the dataloader in advance.
+                # 对于批采样器，dataloader 无法提前得知 batch_size
                 if batch_size is None:
                     batch_size = observed_batch_size
 
-            # Prediction step
+            # 执行预测步骤
             loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
             domain_ids = inputs["domain_ids"].to(loss.device)
 
@@ -511,7 +694,7 @@ class DoReMiTrainer(Trainer):
             if isinstance(logits, tuple):
                 logits = logits[0]
 
-            # compute losses per domain
+            # 逐领域计算损失
             for domain_idx, domain_name in enumerate(self.eval_domain_list):
                 domain_mask = (domain_ids == domain_idx)
                 examplecounts[domain_idx] = examplecounts[domain_idx] + domain_mask.sum()
@@ -528,7 +711,7 @@ class DoReMiTrainer(Trainer):
         torch.distributed.all_reduce(tokencounts)
         torch.distributed.all_reduce(examplecounts)
 
-        # losses/preds/labels on CPU (final containers)
+        # 将损失/预测/标签移回 CPU（最终容器）
         per_domain_losses = {domain_name: losses[domain_idx].item()
                              for domain_idx, domain_name in enumerate(self.eval_domain_list) if tokencounts[domain_idx] > 0}
         per_domain_tokencounts = {domain_name: tokencounts[domain_idx].item()
@@ -536,7 +719,7 @@ class DoReMiTrainer(Trainer):
         per_domain_examplecounts = {domain_name: examplecounts[domain_idx].item()
                                     for domain_idx, domain_name in enumerate(self.eval_domain_list) if tokencounts[domain_idx] > 0}
 
-        # normalize
+        # 归一化
         per_domain_losses = {domain_name: per_domain_losses[domain_name] / per_domain_tokencounts[domain_name]
                              for domain_name in per_domain_losses.keys()}
 
@@ -545,10 +728,10 @@ class DoReMiTrainer(Trainer):
         metrics["uniform_avg_log_perplexity"] = np.mean(list(per_domain_losses.values()))
         metrics["worst_case_log_perplexity"] = np.amax(list(per_domain_losses.values()))
 
-        # To be JSON-serializable, we need to remove numpy types or zero-d tensors
+        # 为兼容 JSON，需要移除 numpy 类型或零维张量
         metrics = denumpify_detensorize(metrics)
 
-        # Prefix all keys with metric_key_prefix + '_'
+        # 为所有键添加 metric_key_prefix + '_' 前缀
         for key in list(metrics.keys()):
             if not key.startswith(f"{metric_key_prefix}_"):
                 metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
@@ -556,11 +739,11 @@ class DoReMiTrainer(Trainer):
         return EvalLoopOutput(predictions=None, label_ids=None, metrics=metrics, num_samples=sum(list(per_domain_examplecounts.values())))
 
     def evaluate_fewshot(self, dataset_names, ignore_keys=None, metric_key_prefix="eval", num_shots=1, max_samples=None):
-        # memory metrics - must set up as early as possible
+        # 内存相关指标——需尽早初始化
         self._memory_tracker.start()
 
         max_token_length = self.tokenizer.model_max_length
-        # prepare tokenizer
+        # 准备分词器
         tokenizer = self.tokenizer
         tokenizer_padding_side = tokenizer.padding_side
         tokenizer_truncation_side = tokenizer.truncation_side
@@ -572,7 +755,7 @@ class DoReMiTrainer(Trainer):
         for dataset_name in dataset_names:
             logger.info(f"Evaluating {dataset_name}...")
 
-            # we pass in num_shots because some datasets are only 0 shot
+            # 部分数据集仅支持 0-shot，需要传入 num_shots
             data_dict = get_eval_dataset(dataset_name, num_shots=num_shots, seed=self.args.seed)
 
             dataset_train = data_dict['dataset_train']
@@ -587,15 +770,15 @@ class DoReMiTrainer(Trainer):
             max_new_tokens = data_dict['max_new_tokens']
             shuffle_train = data_dict['shuffle_train']
 
-            # use training set as few-shot examples, shuffle first
+            # 将训练集用作少样本示例，先打乱
             if dataset_train is not None and shuffle_train:
                 dataset_train = dataset_train.shuffle(seed=self.args.seed)
 
-            # select first num examples
+            # 选取前若干样本
             if max_samples is not None:
                 dataset_val = dataset_val.select(range(max_samples))
 
-            # shard the dataset
+            # 对数据集进行分片
             if dataset_train is not None:
                 dataset_train = dataset_train.shard(num_shards=self.args.world_size, index=self.args.process_index)
             dataset_val = dataset_val.shard(num_shards=self.args.world_size, index=self.args.process_index)
@@ -623,10 +806,10 @@ class DoReMiTrainer(Trainer):
                     yield ex_dict
 
             def data_collator(batch):
-                # self.tokenizer is the HF tokenizer
-                # tokenizer is either HF tokenizer or SPM tokenizer
+                # self.tokenizer 是 HF 分词器
+                # tokenizer 可能是 HF 分词器或 SPM 分词器
                 collated_batch = {k: [f[k] for f in batch] for k in batch[0].keys()}
-                # will do left truncation
+                # 将执行左侧截断
                 tokenized = tokenizer(collated_batch['prompt'], padding=False, truncation=True)
 
                 collated_batch['input_ids'] = torch.tensor(tokenized['input_ids'])[:, -(max_token_length-max_new_tokens):]
@@ -638,17 +821,17 @@ class DoReMiTrainer(Trainer):
 
             dataloader = DataLoader(
                     fewshot_val_dataset,
-                    batch_size=1,  # batch size 1 avoids left padding
+                    batch_size=1,  # 批大小为 1 可避免左填充
                     collate_fn=data_collator,
                     num_workers=1,
                     pin_memory=self.args.dataloader_pin_memory)
 
-            # prepare model
+            # 准备模型
             args = self.args
             model = self._wrap_model(self.model, training=False, dataloader=dataloader)
 
-            # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
-            # while ``train`` is running, cast it to the right dtype first and then put on device
+            # 若希望在非训练态下以 full fp16 或 bf16 执行评估/预测，且未运行 train
+            # 则需先转换为目标数据类型再放置到设备上
             if not self.is_in_train:
                 if args.fp16_full_eval:
                     model = model.to(dtype=torch.float16, device=args.device)
@@ -656,12 +839,12 @@ class DoReMiTrainer(Trainer):
                     model = model.to(dtype=torch.bfloat16, device=args.device)
             model.eval()
 
-            # TODO put this somewhere else?
+            # TODO：是否应将此逻辑移至其他位置？
             model.config.pad_token_id = model.config.eos_token_id
 
             num_correct = torch.tensor(0.0).cuda()
             num_examples = torch.tensor(0.0).cuda()
-            # fewshot eval loop
+            # 少样本评估循环
             for step, inputs in tqdm(enumerate(dataloader)):
                 num_examples += len(inputs['input_ids'])
                 with torch.no_grad():
@@ -693,17 +876,17 @@ class DoReMiTrainer(Trainer):
 
             metrics = {'accuracy': accuracy, 'num_correct': num_correct, 'num_examples': num_examples}
 
-            # To be JSON-serializable, we need to remove numpy types or zero-d tensors
+            # 为兼容 JSON，需要移除 numpy 类型或零维张量
             metrics = denumpify_detensorize(metrics)
 
-            # Prefix all keys with metric_key_prefix + '_'
+            # 为所有键添加 metric_key_prefix + '_' 前缀
             for key in list(metrics.keys()):
                 if not key.startswith(f"{metric_key_prefix}_{num_shots}-shot:{dataset_name}"):
                     metrics[f"{metric_key_prefix}_{num_shots}-shot:{dataset_name}:{key}"] = metrics.pop(key)
 
             all_metrics.update(metrics)
 
-        # comput average metrics across datasets
+        # 计算跨数据集的平均指标
         avg_metrics = defaultdict(list)
         for key in all_metrics:
             if key.endswith('accuracy'):
@@ -718,7 +901,7 @@ class DoReMiTrainer(Trainer):
         for key in avg_metrics.keys():
             all_metrics[f"{metric_key_prefix}_{num_shots}-shot:avg:{key}"] = avg_metrics[key]
 
-        # gather and compute metrics
+        # 汇总并计算指标
         output = EvalLoopOutput(predictions=None, label_ids=None, metrics=all_metrics, num_samples=None)
 
         self.log(output.metrics)
@@ -727,7 +910,7 @@ class DoReMiTrainer(Trainer):
 
         self._memory_tracker.stop_and_update_metrics(output.metrics)
 
-        # restore tokenizer settings
+        # 恢复分词器设置
         tokenizer.padding_side = tokenizer_padding_side
         tokenizer.truncation_side = tokenizer_truncation_side
 
