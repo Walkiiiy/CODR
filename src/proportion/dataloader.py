@@ -63,10 +63,23 @@ class ProportionDataLoader(RandomlyCyclingMultiSourcesExamplesIterable):
 
 if __name__ == "__main__":
     dataset = get_mixed_dataset(
-        dataset_dir='../data/proportion/KodCode_splited/BySubset',
+        dataset_dir='data/KodCode_splited/BySubset',
         # proportion_dict={'code': 0.6, 'text': 0.3, 'math': 0.1}
+        proportion_dict={'Package': 0, 'Algorithm': 0, 'Code': 0, 'Leetcode': 0, 'Filter': 0, 'Prefill': 0, 'Data': 0, 'Taco': 0, 'Docs': 0, 'Codeforces': 0, 'Evol': 0, 'Apps': 1}
     )
 
     # 迭代使用
+    i=0
+    domain_count={}
     for example in dataset:
+        if i>100:
+            break
+        i+=1
+        domain = example['question_id'].split('_')[0]
+        if domain[:4]=='Docs':
+            domain = 'Docs'
+        if domain not in domain_count:
+            domain_count[domain] = 0
+        domain_count[domain]+=1
         print(example)
+    print(domain_count)
