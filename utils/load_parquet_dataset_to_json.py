@@ -8,4 +8,4 @@ for item in os.listdir('data/KodCode_parquet/data'):
     df = pd.read_parquet(f'data/KodCode_parquet/data/{item}')
 
     # 将数据集转换为json文件
-    df.to_json(f'data/KodCode_json/{item}.json', orient='records', lines=True,indent=4)
+    df.to_json(f'data/KodCode_json/{item}.json', orient='records', lines=False,indent=4)
