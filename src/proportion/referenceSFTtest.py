@@ -203,53 +203,25 @@ def train(
         num_training_steps=max_train_steps,
     )
 
-    model.train()
+    model.eval()
     global_step = 0
-
+    total_loss = 0
+    total_steps = 0
     for epoch in range(num_epochs):
         for step, batch in enumerate(dataloader):
+            total_steps += 1
             batch = {k: v.to(device) for k, v in batch.items()}
 
             outputs = model(**batch)
             loss = outputs.loss
-            loss = loss / gradient_accumulation_steps
-            loss.backward()
-
-            if (step + 1) % gradient_accumulation_steps == 0:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
-
+            total_loss += loss.item()
             if global_step % 10 == 0:
-                print(f"Epoch {epoch} step {step} / {len(dataloader)} - loss: {loss.item():.4f}")
+                print(f"Epoch {epoch} step {step} / {len(dataloader)} - loss: {total_loss/total_steps:.4f}")
 
-        # 每个 epoch 存一次
-        os.makedirs(output_dir, exist_ok=True)
-        model.save_pretrained(os.path.join(output_dir, f"epoch-{epoch}"))
-        tokenizer.save_pretrained(os.path.join(output_dir, f"epoch-{epoch}"))
-
-    # 最终再存一份
-    model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    print("Training finished.")
-
+    print(f"Average loss: {total_loss/total_steps:.4f}")
+    return total_loss/total_steps
 
 if __name__ == "__main__":
-    # import argparse
-
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--model_name_or_path", type=str, required=True, help="如 'gpt2' 或本地模型路径")
-    # parser.add_argument("--train_file", type=str, required=True, help="jsonl 格式的训练数据")
-    # parser.add_argument("--output_dir", type=str, default="./output")
-    # parser.add_argument("--max_length", type=int, default=1024)
-    # parser.add_argument("--per_device_batch_size", type=int, default=2)
-    # parser.add_argument("--num_epochs", type=int, default=3)
-    # parser.add_argument("--lr", type=float, default=5e-5)
-    # parser.add_argument("--warmup_ratio", type=float, default=0.03)
-    # parser.add_argument("--weight_decay", type=float, default=0.01)
-    # parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    # args = parser.parse_args()
     os.makedirs('models/reference_model_SFT_5000', exist_ok=True)
     train(
         model_name_or_path='models/Qwen2.5-0.5B-Instruct',
